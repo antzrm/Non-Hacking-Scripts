@@ -3,7 +3,9 @@
 # Extract ASS/SSA subtitles from MKV files (recursively) and convert them to SRT
 # BEHAVIOR: 
 # - Normal mode: Silent scanning. Prints ONLY when a file is actually converted.
-# - Verbose (-v): Prints all files found and scanning progress.
+# - Verbose (-v): Prints files found, detailed stream metadata, and specific reasons for skipping.
+# - Forced Subs: Detects forced flag and names output as *.lang.forced.srt
+# - SAFETY: No guessing. If language metadata is missing, the stream is skipped.
 
 set -u # Exit on undefined variables
 
@@ -46,7 +48,7 @@ Usage: $0 -i <path> [-l <days>] [-v] [-h]
 Options:
     -i <path>    Input path (file or directory)
     -l <days>    Only process files newer than X days
-    -v           Verbose mode (Show all files scanned)
+    -v           Verbose mode (Show all files scanned and debug metadata)
     -h           Show this help message
 EOF
     exit 0
@@ -80,34 +82,68 @@ function process_video_file() {
     
     base_name="${video_file%.mkv}"
     
-    # 1. Get STRICT CSV output from ffprobe
-    local ffprobe_output
-    if ! ffprobe_output=$(ffprobe -v error -select_streams s -show_entries stream=index,codec_name:stream_tags=language -of csv=p=0 "$video_file" 2>/dev/null); then
-        # Only warn in verbose mode to keep quiet output clean, unless it's a critical error
+    # 1. Get ONLY Index and Codec first (This is safe, these always exist)
+    local stream_list
+    if ! stream_list=$(ffprobe -v error -select_streams s -show_entries stream=index,codec_name -of csv=p=0 "$video_file" 2>/dev/null); then
         [[ -n "$verbose_flag" ]] && echo "Warning: Failed to probe $video_file" >&2
         return 1
     fi
 
-    if [[ -z "$ffprobe_output" ]]; then
+    if [[ -z "$stream_list" ]]; then
          [[ -n "$verbose_flag" ]] && echo "  [SKIP] No subtitle streams found"
          return 0
     fi
 
-    # 2. Iterate line by line
-    while IFS=, read -r idx codec lang; do
+    # 2. Iterate through found streams
+    while IFS=, read -r idx codec; do
         idx=$(echo "$idx" | xargs)
         codec=$(echo "$codec" | xargs)
-        lang=$(echo "$lang" | xargs)
 
-        # Check Codec (Only ASS/SSA)
+        # Check Codec (Only process ASS/SSA)
         if [[ "$codec" != "ass" && "$codec" != "ssa" ]]; then
             continue
         fi
 
-        # Check Language Map
+        # 3. SAFER QUERY: Get Language and Forced flag INDIVIDUALLY for this specific index.
+        # This prevents column shifting if the language tag is missing.
+        local lang
+        local is_forced
+        
+        # Get Language Tag (Returns empty string if missing)
+        lang=$(ffprobe -v error -select_streams "$idx" -show_entries stream_tags=language -of default=noprint_wrappers=1:nokey=1 "$video_file" 2>/dev/null)
+        lang=$(echo "$lang" | xargs) # Trim whitespace
+
+        # Get Forced Disposition (Returns 0 or 1)
+        is_forced=$(ffprobe -v error -select_streams "$idx" -show_entries stream_disposition=forced -of default=noprint_wrappers=1:nokey=1 "$video_file" 2>/dev/null)
+        is_forced=$(echo "$is_forced" | xargs)
+
+        # DEBUG OUTPUT: Show exactly what we found
+        if [[ -n "$verbose_flag" ]]; then
+            echo "      [DEBUG] Stream #$idx: Codec='$codec', Lang='$lang', Forced='$is_forced'"
+        fi
+
+        # 4. Validate Language
+        if [[ -z "$lang" ]]; then
+            if [[ -n "$verbose_flag" ]]; then
+                echo "      [SKIP] Stream #$idx: Metadata 'Language' is empty/undefined. Skipping."
+            fi
+            continue
+        fi
+
+        # 5. Check Language Map
         if [[ -n "${LANGUAGE_MAP[$lang]:-}" ]]; then
             local lang_ext="${LANGUAGE_MAP[$lang]}"
-            local output_file="${base_name}${lang_ext}.srt"
+            
+            # Naming logic: .lang.forced.srt
+            local suffix="${lang_ext}.srt"
+            local type_label=""
+            
+            if [[ "$is_forced" == "1" ]]; then
+                suffix="${lang_ext}.forced.srt"
+                type_label=" (FORCED)"
+            fi
+            
+            local output_file="${base_name}${suffix}"
 
             # Check if SRT exists
             if [[ -f "$output_file" ]]; then
@@ -116,11 +152,10 @@ function process_video_file() {
             fi
 
             # PRINTING LOGIC:
-            # We always print this line because if we are here, we are about to do work.
             if [[ -z "$verbose_flag" ]]; then
-                echo "Converting: $(basename "$video_file") ($lang) -> $(basename "$output_file")"
+                echo "Converting: $(basename "$video_file") ($lang)${type_label} -> $(basename "$output_file")"
             else
-                echo "      [EXTRACT] Stream #$idx ($lang) -> $output_file"
+                echo "      [EXTRACT] Stream #$idx ($lang)${type_label} -> $output_file"
             fi
 
             if convert_subtitle "$video_file" "$idx" "$output_file"; then
@@ -135,7 +170,7 @@ function process_video_file() {
             fi
         fi
 
-    done <<< "$ffprobe_output"
+    done <<< "$stream_list"
 }
 
 function convert_subtitles() {
@@ -165,8 +200,6 @@ function convert_subtitles() {
 
     local total=${#found_files[@]}
     if [[ $total -eq 0 ]]; then
-        # Only print "No files found" if user specifically asked for verbose, or if it's truly empty?
-        # Usually it's helpful to know zero files were found even in quiet mode.
         echo "No MKV files found matching criteria."
         return 0
     fi
